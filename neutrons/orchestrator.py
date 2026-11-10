@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from neutrons.agent.core import AgentCore
 from neutrons.config import Settings, settings
 from neutrons.model_gateway import ChatModelGateway, ModelGatewayError, OllamaChatGateway
 
@@ -27,6 +28,7 @@ class AgentOrchestrator:
     ) -> None:
         self.gateway = gateway if gateway is not None else OllamaChatGateway(configuration=configuration)
         self.configuration = configuration
+        self.agent_core = AgentCore(self.gateway, chat_system_prompt=self.build_system_prompt())
 
     def build_system_prompt(self) -> str:
         return (
@@ -51,14 +53,24 @@ class AgentOrchestrator:
                 "context": {"model": self.gateway.model_name, "history_count": len(bounded_history)},
             },
         )
-        response_text = self.gateway.chat(
-            user_message,
-            system_prompt=self.build_system_prompt(),
-            history=bounded_history,
-        )
+        core_result = self.agent_core.process(user_message, history=bounded_history)
+        if core_result.status in {"needs_clarification", "unsupported"}:
+            response_text = core_result.response
+        elif core_result.intent.value == "chat" and core_result.response is None:
+            response_text = self.gateway.chat(
+                user_message,
+                system_prompt=self.build_system_prompt(),
+                history=bounded_history,
+            )
+        else:
+            response_text = core_result.response
         if not isinstance(response_text, str) or not response_text.strip():
             raise ModelGatewayError("Model gateway returned no response text")
-        return OrchestratorResult(response=response_text, model=self.gateway.model_name)
+        return OrchestratorResult(
+            response=response_text,
+            model=self.gateway.model_name,
+            status=core_result.status,
+        )
 
     def _limit_history(
         self,

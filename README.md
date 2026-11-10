@@ -1,7 +1,7 @@
 # NEUTRONS
 
 NEUTRONS là trợ lý AI cá nhân theo hướng local-first. Phiên bản hiện tại gồm giao
-diện desktop Tkinter, API FastAPI, bộ điều phối chat và gateway kết nối duy nhất
+diện desktop Tkinter, API FastAPI, Agent Core bounded và gateway kết nối duy nhất
 đến model Ollama đã cấu hình. Backend chỉ bind vào `127.0.0.1`.
 
 ## Kiến trúc hiện tại
@@ -10,7 +10,10 @@ diện desktop Tkinter, API FastAPI, bộ điều phối chat và gateway kết 
 flowchart LR
     UI[Tkinter Desktop] --> API[FastAPI API]
     API --> CORE[Agent Orchestrator]
-    CORE --> GATEWAY[Chat Model Gateway]
+    CORE --> AGENT[Agent Core]
+    AGENT --> GATEWAY[Chat Model Gateway]
+    AGENT --> STATE[In-memory Task State]
+    AGENT --> ACTIONS[Explicit Action Registry]
     GATEWAY --> OLLAMA[Ollama local]
     OLLAMA --> MODEL[Model đã cấu hình]
 ```
@@ -20,12 +23,38 @@ flowchart LR
 - `neutrons/app.py`: request validation, giới hạn kích thước, API errors và
   request lifecycle logs; `/healthz` kiểm tra liveness, `/readyz` kiểm tra
   Ollama và model đã cấu hình.
-- `neutrons/orchestrator.py`: xác thực tin nhắn, giới hạn lịch sử hội thoại và
-  gọi interface của model gateway.
+- `neutrons/orchestrator.py`: xác thực tin nhắn, giới hạn lịch sử hội thoại,
+  tích hợp Agent Core và giữ chat API tương thích.
+- `neutrons/agent/`: schemas, intent router, planner, executor, result validator,
+  state manager và luồng phối hợp task.
 - `neutrons/model_gateway.py`: interface chat cùng adapter Ollama, kiểm tra
   response, model availability và model metadata.
 - `neutrons/config.py`: settings từ environment, kiểm tra giá trị và defaults.
 - `neutrons/logging_config.py`: JSON logs, không ghi nội dung hội thoại.
+
+### Agent Core (Phase 2)
+
+Luồng task: request → Router → Planner → Executor → Result Validator → cập nhật
+Task State. Router chỉ phân loại; Planner chỉ tạo plan; chỉ Executor được gọi
+action đã đăng ký. Schemas Pydantic từ chối field không biết. Plan được giới hạn
+tối đa 8 bước và 20.000 ký tự, kiểm tra action, ID duy nhất, dependency hợp lệ
+và chu trình. Executor kiểm tra input/output schema, giới hạn output 20.000 ký
+tự, permission, timeout (tối đa 30 giây), dependency và xác nhận riêng cho action
+yêu cầu confirmation. Handler phải async và kiểm tra deadline/cancellation tại
+các ranh giới an toàn. Permission mặc định là **deny**; model không thể tự cấp
+quyền. Không có shell/Python execution.
+
+Hiện chưa đăng ký action nào, do đó yêu cầu TASK được trả về trạng thái
+`unsupported` một cách an toàn thay vì tạo tool giả. Muốn bật một action sau này,
+ứng dụng phải đăng ký handler async cùng input/output schema và cấp policy quyền
+riêng; destructive/consequential actions vẫn cần xác nhận rõ ràng. Chat thường
+giữ nguyên API và fallback về chat cũ khi structured intent response không hợp lệ.
+
+Task state được giữ trong bộ nhớ của process, tối đa 100 record; record terminal
+cũ nhất có thể bị loại bỏ để nhường chỗ. State machine từ chối chuyển trạng thái
+không hợp lệ; hủy chỉ được xử lý tại ranh giới an toàn giữa các bước. Đây chưa
+phải API hủy tác vụ hay persistent task storage. Không có SQLite, memory bền vững,
+hoặc UI task-management trong phase này.
 
 ## Cài đặt
 
@@ -162,8 +191,8 @@ và không tải model.
 
 ## Giới hạn và lộ trình
 
-Hiện tại NEUTRONS là chat local đơn model, không có memory bền vững, session
-manager, planner, tool execution, streaming hoặc event bus. History hiện do
-desktop gửi lên trong từng request, chưa được lưu xuống SQLite. Các bước tiếp
-theo là Agent Core (intent/planner/executor), SQLite conversation memory, công
-cụ read-only có quyền hạn, rồi tích hợp session vào desktop.
+NEUTRONS hiện dùng một model local, không có memory bền vững, session manager,
+tool execution capability, streaming hoặc event bus. History do desktop gửi
+trong từng request, chưa lưu xuống SQLite. Agent Core hiện chỉ cung cấp nền tảng
+bounded; chưa có action được bật. SQLite conversation memory, các capability
+read-only có quyền hạn và tích hợp session vào desktop thuộc phase sau.
