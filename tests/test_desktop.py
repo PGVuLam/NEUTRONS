@@ -10,6 +10,7 @@ from neutrons.desktop import (
     DesktopStartupError,
     ManagedBackend,
     backend_is_healthy,
+    backend_is_ready,
     ensure_backend,
 )
 
@@ -34,12 +35,57 @@ def test_backend_is_not_healthy_for_other_service() -> None:
         assert not backend_is_healthy(client)
 
 
+def test_backend_liveness_can_be_healthy_while_model_readiness_fails() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"status": "ok", "app": "NEUTRONS"}, request=request)
+        return httpx.Response(
+            503,
+            json={"detail": "The configured model was not found in Ollama."},
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport, base_url=API_BASE_URL) as client:
+        ready, reason = backend_is_ready(client)
+        assert backend_is_healthy(client)
+
+    assert not ready
+    assert reason == "Backend đang chạy nhưng Ollama/model chưa sẵn sàng."
+
+
+def test_backend_readiness_succeeds_when_model_is_available() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={"status": "ready", "model": "qwen3:4b"},
+            request=request,
+        )
+    )
+    with httpx.Client(transport=transport, base_url=API_BASE_URL) as client:
+        assert backend_is_ready(client) == (True, "Model sẵn sàng.")
+
+
 def test_backend_startup_reports_port_conflict(monkeypatch) -> None:
     monkeypatch.setattr("neutrons.desktop.backend_is_healthy", lambda client: client.is_closed)
     monkeypatch.setattr("neutrons.desktop._port_is_open", lambda: True)
 
     with pytest.raises(DesktopStartupError, match="đang được một ứng dụng khác sử dụng"):
         ensure_backend()
+
+
+def test_model_readiness_failure_does_not_become_a_port_conflict(monkeypatch) -> None:
+    monkeypatch.setattr("neutrons.desktop.backend_is_healthy", lambda client: not client.is_closed)
+    monkeypatch.setattr(
+        "neutrons.desktop.backend_is_ready",
+        lambda client: (client.is_closed, "configured model is missing"),
+    )
+    monkeypatch.setattr(
+        "neutrons.desktop._port_is_open",
+        lambda: (_ for _ in ()).throw(AssertionError("port must not be checked as a conflict")),
+    )
+
+    assert ensure_backend() is None
 
 
 def test_backend_startup_includes_captured_process_log(monkeypatch) -> None:

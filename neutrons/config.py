@@ -15,6 +15,7 @@ class Settings:
     model_name: str = "qwen3:4b"
     ollama_base_url: str = "http://127.0.0.1:11434"
     request_timeout_seconds: float = 120.0
+    readiness_timeout_seconds: float = 3.0
     temperature: float = 0.2
     num_predict: int = 512
     num_ctx: int = 4096
@@ -29,6 +30,11 @@ class Settings:
             raise ValueError("NEUTRONS_MODEL must not be empty")
         if not math.isfinite(self.request_timeout_seconds) or self.request_timeout_seconds <= 0:
             raise ValueError("NEUTRONS_REQUEST_TIMEOUT must be a positive finite number")
+        if (
+            not math.isfinite(self.readiness_timeout_seconds)
+            or not 0 < self.readiness_timeout_seconds <= 30
+        ):
+            raise ValueError("NEUTRONS_READINESS_TIMEOUT must be greater than 0 and at most 30 seconds")
         if not math.isfinite(self.temperature) or not 0 <= self.temperature <= 2:
             raise ValueError("NEUTRONS_TEMPERATURE must be between 0 and 2")
         if self.num_predict < 1:
@@ -39,8 +45,8 @@ class Settings:
             raise ValueError("NEUTRONS_API_PORT must be between 1 and 65535")
         if self.max_history_messages < 0:
             raise ValueError("NEUTRONS_MAX_HISTORY_MESSAGES must not be negative")
-        if self.max_history_chars < 1:
-            raise ValueError("NEUTRONS_MAX_HISTORY_CHARS must be at least 1")
+        if self.max_history_chars < 0:
+            raise ValueError("NEUTRONS_MAX_HISTORY_CHARS must not be negative")
         if self.max_request_chars < 1:
             raise ValueError("NEUTRONS_MAX_REQUEST_CHARS must be at least 1")
         if self.log_level.upper() not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
@@ -84,6 +90,7 @@ class Settings:
             model_name=values.get("NEUTRONS_MODEL", "qwen3:4b"),
             ollama_base_url=values.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
             request_timeout_seconds=decimal("NEUTRONS_REQUEST_TIMEOUT", 120.0),
+            readiness_timeout_seconds=decimal("NEUTRONS_READINESS_TIMEOUT", 3.0),
             temperature=decimal("NEUTRONS_TEMPERATURE", 0.2),
             num_predict=integer("NEUTRONS_NUM_PREDICT", 512),
             num_ctx=integer("NEUTRONS_NUM_CTX", 4096),

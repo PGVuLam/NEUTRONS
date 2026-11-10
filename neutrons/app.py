@@ -89,6 +89,33 @@ def healthcheck() -> dict[str, str]:
     }
 
 
+@app.get("/readyz")
+def readiness() -> dict[str, str]:
+    try:
+        model = orchestrator.gateway.get_model_info(timeout=settings.readiness_timeout_seconds)
+    except ModelGatewayError as exc:
+        logger.warning(
+            "Readiness check could not reach the configured model",
+            extra={"event": "readiness_provider_unavailable"},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Local Ollama is unavailable or did not respond to the readiness check.",
+        ) from exc
+
+    if model is None:
+        logger.warning(
+            "Configured model is not installed",
+            extra={"event": "readiness_model_missing", "context": {"model": settings.model_name}},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The configured model was not found in Ollama.",
+        )
+
+    return {"status": "ready", "app": settings.app_name, "model": model.name}
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {"message": f"{settings.app_name} is running", "version": settings.app_version}

@@ -18,7 +18,8 @@ flowchart LR
 - `neutrons/desktop.py`: cửa sổ chat; gọi HTTP ở worker thread và cập nhật
   widget qua queue trên main thread.
 - `neutrons/app.py`: request validation, giới hạn kích thước, API errors và
-  request lifecycle logs.
+  request lifecycle logs; `/healthz` kiểm tra liveness, `/readyz` kiểm tra
+  Ollama và model đã cấu hình.
 - `neutrons/orchestrator.py`: xác thực tin nhắn, giới hạn lịch sử hội thoại và
   gọi interface của model gateway.
 - `neutrons/model_gateway.py`: interface chat cùng adapter Ollama, kiểm tra
@@ -55,6 +56,7 @@ Các biến môi trường tùy chọn:
 | `NEUTRONS_MODEL` | `qwen3:4b` | Tên model có sẵn trong Ollama |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Địa chỉ Ollama (HTTP/HTTPS, không chứa credentials) |
 | `NEUTRONS_REQUEST_TIMEOUT` | `120` | Timeout request model, tính bằng giây |
+| `NEUTRONS_READINESS_TIMEOUT` | `3` | Timeout readiness check, tối đa 30 giây |
 | `NEUTRONS_TEMPERATURE` | `0.2` | Generation temperature (0–2) |
 | `NEUTRONS_NUM_PREDICT` | `512` | Số token sinh tối đa |
 | `NEUTRONS_NUM_CTX` | `4096` | Context window gửi cho Ollama |
@@ -69,8 +71,10 @@ Trong **CMD**, cú pháp tương đương là `set NEUTRONS_NUM_PREDICT=256`.
 Thay đổi environment rồi khởi động lại ứng dụng để settings được nạp lại.
 
 Settings sai định dạng hoặc ngoài giới hạn sẽ báo lỗi khi ứng dụng khởi động.
-Lịch sử chỉ giữ các tin mới nhất trong giới hạn cấu hình; đây là giới hạn theo
-số ký tự, chưa phải bộ đếm token chính xác.
+History được chọn từ tin mới nhất về cũ hơn, không vượt giới hạn số tin và ký
+tự. Tin nhắn mới nhất quá dài được giữ phần cuối; tin cũ chỉ được thêm nếu vừa
+trọn vẹn vào phần ngân sách còn lại. Đây là giới hạn ký tự, chưa phải bộ đếm
+token chính xác.
 
 ## Chạy giao diện desktop trên Windows
 
@@ -84,6 +88,10 @@ Desktop kiểm tra backend tại `127.0.0.1:<NEUTRONS_API_PORT>`. Nếu chưa c�
 nó tự khởi động một tiến trình local và giữ log để báo lỗi nếu khởi động thất
 bại. Nếu port đã có ứng dụng khác, giao diện báo port conflict thay vì im lặng
 khởi một server thứ hai.
+
+Backend liveness và model readiness được kiểm tra riêng. Nếu API còn sống nhưng
+Ollama/model chưa sẵn sàng, UI vẫn mở và hiển thị trạng thái
+`BACKEND OK · MODEL CHƯA SẴN SÀNG`; lỗi model không bị nhầm là lỗi chiếm port.
 
 Khi đóng giao diện, tiến trình backend do chính giao diện khởi chạy sẽ được dừng.
 Backend đã chạy sẵn sẽ không bị dừng. `Enter` gửi tin nhắn; `Shift+Enter` xuống
@@ -105,6 +113,11 @@ Invoke-RestMethod http://127.0.0.1:8000/healthz
 ```
 
 Swagger UI: `http://127.0.0.1:8000/docs`.
+
+`GET /healthz` chỉ xác nhận FastAPI đang sống, không gọi Ollama. `GET /readyz`
+dùng timeout ngắn để xác nhận Ollama phản hồi và model cấu hình đã được cài:
+trả `200` khi sẵn sàng, `503` khi provider/model không khả dụng. Endpoint này
+không chạy inference và không cài/tải model.
 
 ### Chat API
 

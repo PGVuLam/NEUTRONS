@@ -23,6 +23,10 @@ class ModelNotFoundError(ModelUnavailableError):
     """Raised when the configured model is not installed in Ollama."""
 
 
+class ModelEndpointError(ModelGatewayError):
+    """Raised when Ollama reports a missing or invalid API endpoint."""
+
+
 class ModelTimeoutError(ModelGatewayError):
     """Raised when Ollama does not respond before the configured timeout."""
 
@@ -53,9 +57,9 @@ class ChatModelGateway(Protocol):
         history: Sequence[Mapping[str, str]] | None = None,
     ) -> str: ...
 
-    def check_health(self) -> bool: ...
+    def check_health(self, timeout: float | None = None) -> bool: ...
 
-    def get_model_info(self) -> ModelInfo | None: ...
+    def get_model_info(self, timeout: float | None = None) -> ModelInfo | None: ...
 
 
 class OllamaChatGateway:
@@ -77,13 +81,15 @@ class OllamaChatGateway:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}/{path.lstrip('/')}"
+        request_timeout = self.timeout if timeout is None else timeout
         try:
             if method == "POST":
-                response = httpx.post(url, json=payload, timeout=self.timeout)
+                response = httpx.post(url, json=payload, timeout=request_timeout)
             elif method == "GET":
-                response = httpx.get(url, timeout=self.timeout)
+                response = httpx.get(url, timeout=request_timeout)
             else:
                 raise ValueError(f"Unsupported Ollama HTTP method: {method}")
             response.raise_for_status()
@@ -95,7 +101,22 @@ class OllamaChatGateway:
             raise ModelTimeoutError("Ollama did not respond before the configured timeout") from exc
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
-                raise ModelNotFoundError("The configured Ollama model or API endpoint was not found") from exc
+                try:
+                    error_body = exc.response.json()
+                except ValueError:
+                    error_body = None
+                provider_error = error_body.get("error") if isinstance(error_body, dict) else None
+                if (
+                    path.lstrip("/") in {"api/chat", "api/generate"}
+                    and isinstance(provider_error, str)
+                    and "model" in provider_error.casefold()
+                    and any(
+                        marker in provider_error.casefold()
+                        for marker in ("not found", "does not exist", "not available")
+                    )
+                ):
+                    raise ModelNotFoundError("The configured Ollama model was not found") from exc
+                raise ModelEndpointError("Ollama returned 404 for an API endpoint") from exc
             raise ModelUnavailableError(
                 f"Ollama returned HTTP {exc.response.status_code}"
             ) from exc
@@ -187,14 +208,14 @@ class OllamaChatGateway:
             raise InvalidModelResponseError("Ollama response did not complete generation")
         return content.strip()
 
-    def check_health(self) -> bool:
-        data = self._request_json("GET", "api/tags")
+    def check_health(self, timeout: float | None = None) -> bool:
+        data = self._request_json("GET", "api/tags", timeout=timeout)
         if not isinstance(data.get("models"), list):
             raise InvalidModelResponseError("Ollama model-list response is malformed")
         return True
 
-    def get_model_info(self) -> ModelInfo | None:
-        data = self._request_json("GET", "api/tags")
+    def get_model_info(self, timeout: float | None = None) -> ModelInfo | None:
+        data = self._request_json("GET", "api/tags", timeout=timeout)
         models = data.get("models")
         if not isinstance(models, list):
             raise InvalidModelResponseError("Ollama model-list response is malformed")

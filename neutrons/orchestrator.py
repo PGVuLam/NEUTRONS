@@ -64,12 +64,16 @@ class AgentOrchestrator:
         self,
         history: Sequence[Mapping[str, str]],
     ) -> list[dict[str, str]]:
+        """Keep whole newest messages; truncate only the newest message from its start."""
         max_messages = self.configuration.max_history_messages
         max_chars = self.configuration.max_history_chars
+        if max_messages == 0 or max_chars == 0:
+            return []
+
         bounded: list[dict[str, str]] = []
         used_chars = 0
-
-        for item in reversed(history[-max_messages:] if max_messages else ()):
+        candidates = history[-max_messages:]
+        for item in reversed(candidates):
             role = item.get("role")
             content = item.get("content")
             if role not in {"user", "assistant"} or not isinstance(content, str) or not content:
@@ -77,10 +81,13 @@ class AgentOrchestrator:
             available_chars = max_chars - used_chars
             if available_chars <= 0:
                 break
-            bounded.append({"role": role, "content": content[:available_chars]})
-            used_chars += min(len(content), available_chars)
-            if len(content) >= available_chars:
+            if not bounded and len(content) > available_chars:
+                bounded.append({"role": role, "content": content[-available_chars:]})
                 break
+            if len(content) > available_chars:
+                break
+            bounded.append({"role": role, "content": content})
+            used_chars += len(content)
 
         bounded.reverse()
         return bounded

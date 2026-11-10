@@ -85,6 +85,29 @@ def backend_is_healthy(client: httpx.Client) -> bool:
     return payload.get("status") == "ok" and payload.get("app") == settings.app_name
 
 
+def backend_is_ready(client: httpx.Client) -> tuple[bool, str]:
+    try:
+        response = client.get(f"{API_BASE_URL}/readyz")
+    except httpx.HTTPError:
+        return False, "Readiness endpoint không phản hồi."
+
+    if response.status_code == 200:
+        try:
+            payload = response.json()
+        except ValueError:
+            return False, "Backend trả readiness response không hợp lệ."
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "ready"
+            and payload.get("model") == settings.model_name
+        ):
+            return True, "Model sẵn sàng."
+        return False, "Backend trả readiness response không hợp lệ."
+    if response.status_code == 503:
+        return False, "Backend đang chạy nhưng Ollama/model chưa sẵn sàng."
+    return False, f"Readiness endpoint trả HTTP {response.status_code}."
+
+
 def _port_is_open() -> bool:
     try:
         with socket.create_connection(("127.0.0.1", settings.api_port), timeout=0.25):
@@ -103,6 +126,12 @@ def _startup_error_message(message: str, backend: ManagedBackend | None = None) 
 def ensure_backend() -> ManagedBackend | None:
     with httpx.Client(timeout=1.0) as client:
         if backend_is_healthy(client):
+            ready, reason = backend_is_ready(client)
+            if not ready:
+                logger.warning(
+                    "Backend is alive but model is not ready",
+                    extra={"event": "desktop_model_not_ready", "context": {"reason": reason}},
+                )
             return None
 
     if _port_is_open():
@@ -146,6 +175,15 @@ def ensure_backend() -> ManagedBackend | None:
                 backend.close_output()
                 raise DesktopStartupError(message)
             if backend_is_healthy(client):
+                ready, reason = backend_is_ready(client)
+                if not ready:
+                    logger.warning(
+                        "Backend started but model is not ready",
+                        extra={
+                            "event": "desktop_model_not_ready",
+                            "context": {"reason": reason},
+                        },
+                    )
                 logger.info(
                     "Started local backend",
                     extra={
@@ -180,6 +218,7 @@ class NeutronsDesktop:
         self._configure_styles()
         self._build_layout()
         self._show_welcome()
+        self._refresh_readiness_status()
         self.root.after(100, self._poll_results)
 
     def _configure_styles(self) -> None:
@@ -265,9 +304,9 @@ class NeutronsDesktop:
         ).grid(row=0, column=0, sticky="w")
         self.status_label = tk.Label(
             header,
-            text=f"●  ĐANG DÙNG  {settings.model_name}",
+            text="●  ĐANG KIỂM TRA MODEL…",
             bg=BACKGROUND,
-            fg="#70d6a4",
+            fg="#f0c674",
             font=("Segoe UI", 9, "bold"),
         )
         self.status_label.grid(row=0, column=1, sticky="e", padx=(12, 18))
@@ -333,6 +372,21 @@ class NeutronsDesktop:
             fg=MUTED,
             font=("Segoe UI", 8),
         ).grid(row=3, column=0, sticky="e", pady=(7, 0))
+
+    def _refresh_readiness_status(self) -> None:
+        timeout = settings.readiness_timeout_seconds + 0.5
+        with httpx.Client(timeout=timeout) as client:
+            ready, reason = backend_is_ready(client)
+        if ready:
+            self.status_label.configure(
+                text=f"●  SẴN SÀNG  {settings.model_name}", fg="#70d6a4"
+            )
+        else:
+            self.status_label.configure(text="●  BACKEND OK · MODEL CHƯA SẴN SÀNG", fg="#ff8888")
+            logger.warning(
+                "Desktop reports unavailable model",
+                extra={"event": "desktop_model_not_ready", "context": {"reason": reason}},
+            )
 
     @staticmethod
     def _sidebar_section(parent: tk.Widget, text: str) -> None:

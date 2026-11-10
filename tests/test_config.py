@@ -43,3 +43,12 @@ def test_settings_reject_invalid_values(name: str, value: str, message: str) -> 
 def test_settings_reports_non_numeric_environment_value() -> None:
     with pytest.raises(ValueError, match="NEUTRONS_NUM_CTX must be an integer"):
         Settings.from_env({"NEUTRONS_NUM_CTX": "large"})
+
+
+def test_zero_history_character_budget_is_supported() -> None:
+    assert Settings.from_env({"NEUTRONS_MAX_HISTORY_CHARS": "0"}).max_history_chars == 0
+
+
+def test_readiness_timeout_is_bounded() -> None:
+    with pytest.raises(ValueError, match="at most 30 seconds"):
+        Settings.from_env({"NEUTRONS_READINESS_TIMEOUT": "31"})

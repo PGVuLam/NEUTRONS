@@ -7,9 +7,11 @@ from neutrons.config import Settings
 from neutrons.model_gateway import (
     EmptyModelResponseError,
     InvalidModelResponseError,
+    ModelEndpointError,
     ModelInfo,
     ModelNotFoundError,
     ModelTimeoutError,
+    ModelUnavailableError,
     OllamaChatGateway,
 )
 
@@ -179,9 +181,131 @@ def test_not_found_http_status_maps_to_model_not_found(monkeypatch) -> None:
     def fake_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
         assert json["model"] == "qwen3:4b"
         assert timeout > 0
-        return httpx.Response(404, request=httpx.Request("POST", url))
+        return httpx.Response(
+            404,
+            json={"error": "model 'qwen3:4b' not found, try pulling it first"},
+            request=httpx.Request("POST", url),
+        )
 
     monkeypatch.setattr("neutrons.model_gateway.httpx.post", fake_post)
 
     with pytest.raises(ModelNotFoundError):
+        OllamaChatGateway().chat("Xin chào")
+
+
+def test_chat_404_with_model_not_found_body_maps_to_model_not_found(monkeypatch) -> None:
+    def fake_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
+        assert url.endswith("/api/chat")
+        assert json["model"] == "qwen3:4b"
+        assert timeout > 0
+        return httpx.Response(
+            404,
+            json={"error": "model 'qwen3:4b' not found"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.post", fake_post)
+
+    with pytest.raises(ModelNotFoundError):
+        OllamaChatGateway().chat("Xin chào")
+
+
+def test_generate_404_with_model_not_found_body_maps_to_model_not_found(monkeypatch) -> None:
+    def fake_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
+        assert url.endswith("/api/generate")
+        assert json["model"] == "qwen3:4b"
+        assert timeout > 0
+        return httpx.Response(
+            404,
+            json={"error": "model does not exist"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.post", fake_post)
+
+    with pytest.raises(ModelNotFoundError):
+        OllamaChatGateway().generate("prompt")
+
+
+def test_tags_endpoint_404_maps_to_endpoint_error(monkeypatch) -> None:
+    def fake_get(url: str, *, timeout: float) -> httpx.Response:
+        assert url.endswith("/api/tags")
+        assert timeout > 0
+        return httpx.Response(
+            404,
+            json={"error": "model 'qwen3:4b' not found"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.get", fake_get)
+
+    with pytest.raises(ModelEndpointError, match="API endpoint"):
+        OllamaChatGateway().get_model_info()
+
+
+def test_unknown_endpoint_404_maps_to_endpoint_error(monkeypatch) -> None:
+    def fake_get(url: str, *, timeout: float) -> httpx.Response:
+        assert url.endswith("/api/unknown")
+        assert timeout > 0
+        return httpx.Response(404, json={}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.get", fake_get)
+
+    with pytest.raises(ModelEndpointError):
+        OllamaChatGateway()._request_json("GET", "api/unknown")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        lambda request: httpx.Response(404, json={"message": "missing"}, request=request),
+        lambda request: httpx.Response(404, json={"error": "unknown issue"}, request=request),
+        lambda request: httpx.Response(404, content=b"not-json", request=request),
+    ],
+)
+def test_unrecognized_or_malformed_404_is_endpoint_error(monkeypatch, response) -> None:
+    def fake_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
+        assert json["model"] == "qwen3:4b"
+        assert timeout > 0
+        return response(httpx.Request("POST", url))
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.post", fake_post)
+
+    with pytest.raises(ModelEndpointError):
+        OllamaChatGateway().chat("Xin chào")
+
+
+def test_success_response_with_malformed_json_is_invalid_response(monkeypatch) -> None:
+    def fake_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
+        assert json["model"] == "qwen3:4b"
+        assert timeout > 0
+        return httpx.Response(200, content=b"not-json", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.post", fake_post)
+
+    with pytest.raises(InvalidModelResponseError, match="invalid JSON"):
+        OllamaChatGateway().chat("Xin chào")
+
+
+def test_non_404_http_error_remains_provider_unavailable(monkeypatch) -> None:
+    def fake_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
+        assert json["model"] == "qwen3:4b"
+        assert timeout > 0
+        return httpx.Response(500, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.post", fake_post)
+
+    with pytest.raises(ModelUnavailableError, match="HTTP 500"):
+        OllamaChatGateway().chat("Xin chào")
+
+
+def test_connection_error_maps_to_provider_unavailable(monkeypatch) -> None:
+    def fake_post(url: str, *, json: dict[str, object], timeout: float) -> httpx.Response:
+        assert json["model"] == "qwen3:4b"
+        assert timeout > 0
+        raise httpx.ConnectError("internal detail", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("neutrons.model_gateway.httpx.post", fake_post)
+
+    with pytest.raises(ModelUnavailableError, match="Could not connect"):
         OllamaChatGateway().chat("Xin chào")
