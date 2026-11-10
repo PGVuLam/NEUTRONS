@@ -34,17 +34,17 @@ class IntentRouter:
         history: Sequence[Mapping[str, str]] | None = None,
     ) -> IntentDecision:
         classification_prompt = (
-            "You are NEUTRONS, a local personal assistant. "
             "Classify the request as chat, task, clarification, or unsupported. "
-            "Do not plan or execute actions. For chat, provide the direct user-facing "
-            "answer in response. For ambiguous requests, choose clarification. "
-            "Return only a JSON object with intent, confidence (0 to 1), reason, "
-            "and response (string for chat, otherwise null)."
+            "Do not plan or execute actions. For chat, provide a direct and concise "
+            "user-facing answer in response. For clarification, ask one specific question. "
+            "For unsupported requests, explain the limitation without claiming action. "
+            "Use the language of the current request. Return only an object with intent, "
+            "confidence (0 to 1), and response. Use no other fields."
         )
         system_prompt = " ".join(
             part for part in (self._chat_system_prompt, classification_prompt) if part
         )
-        raw = self._gateway.chat(
+        raw = self._gateway.chat_json(
             user_message,
             system_prompt=system_prompt,
             history=history,
@@ -54,11 +54,7 @@ class IntentRouter:
                 "Intent router output exceeded its limit",
                 extra={"event": "intent_output_invalid"},
             )
-            return IntentDecision(
-                intent=Intent.CHAT,
-                confidence=1,
-                reason="Fallback to the existing chat path because classification was invalid.",
-            )
+            return self._fallback_to_chat()
         try:
             value = json.loads(raw)
             decision = IntentDecision.model_validate(value)
@@ -67,18 +63,21 @@ class IntentRouter:
                 "Intent router returned malformed output",
                 extra={"event": "intent_output_invalid"},
             )
-            return IntentDecision(
-                intent=Intent.CHAT,
-                confidence=1,
-                reason="Fallback to the existing chat path because classification was invalid.",
-            )
+            return self._fallback_to_chat()
 
         if decision.confidence < self._confidence_threshold:
-            return self._clarification(
-                "Yêu cầu chưa đủ rõ để xử lý an toàn; vui lòng bổ sung thông tin."
+            if not decision.response:
+                return self._fallback_to_chat()
+            return IntentDecision(
+                intent=Intent.CLARIFICATION,
+                confidence=decision.confidence,
+                response=decision.response,
             )
+        if decision.intent in {Intent.CHAT, Intent.CLARIFICATION, Intent.UNSUPPORTED}:
+            if not decision.response:
+                return self._fallback_to_chat()
         return decision
 
     @staticmethod
-    def _clarification(reason: str) -> IntentDecision:
-        return IntentDecision(intent=Intent.CLARIFICATION, confidence=0, reason=reason)
+    def _fallback_to_chat() -> IntentDecision:
+        return IntentDecision(intent=Intent.CHAT, confidence=1)

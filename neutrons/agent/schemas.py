@@ -21,7 +21,6 @@ class Intent(str, Enum):
 class IntentDecision(Contract):
     intent: Intent
     confidence: float = Field(ge=0, le=1)
-    reason: str = Field(max_length=500)
     response: str | None = Field(default=None, max_length=20_000)
 
 
@@ -70,6 +69,15 @@ class StepResult(Contract):
 class ValidationResult(Contract):
     valid: bool
     errors: list[str] = Field(default_factory=list)
+
+
+class TaskExecutionResult(Contract):
+    task_id: str
+    status: TaskStatus
+    step_results: list[StepResult] = Field(default_factory=list)
+    step_errors: dict[str, str] = Field(default_factory=dict)
+    validated_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    error_code: str | None = None
 
 
 class TaskSnapshot(Contract):

@@ -17,6 +17,7 @@ class Settings:
     request_timeout_seconds: float = 120.0
     readiness_timeout_seconds: float = 3.0
     temperature: float = 0.2
+    thinking_mode: str = "auto"
     num_predict: int = 512
     num_ctx: int = 4096
     api_port: int = 8000
@@ -37,6 +38,8 @@ class Settings:
             raise ValueError("NEUTRONS_READINESS_TIMEOUT must be greater than 0 and at most 30 seconds")
         if not math.isfinite(self.temperature) or not 0 <= self.temperature <= 2:
             raise ValueError("NEUTRONS_TEMPERATURE must be between 0 and 2")
+        if self.thinking_mode not in {"auto", "enabled", "disabled"}:
+            raise ValueError("NEUTRONS_THINKING must be auto, enabled, or disabled")
         if self.num_predict < 1:
             raise ValueError("NEUTRONS_NUM_PREDICT must be at least 1")
         if self.num_ctx < 1:
@@ -92,6 +95,7 @@ class Settings:
             request_timeout_seconds=decimal("NEUTRONS_REQUEST_TIMEOUT", 120.0),
             readiness_timeout_seconds=decimal("NEUTRONS_READINESS_TIMEOUT", 3.0),
             temperature=decimal("NEUTRONS_TEMPERATURE", 0.2),
+            thinking_mode=values.get("NEUTRONS_THINKING", "auto").casefold(),
             num_predict=integer("NEUTRONS_NUM_PREDICT", 512),
             num_ctx=integer("NEUTRONS_NUM_CTX", 4096),
             api_port=integer("NEUTRONS_API_PORT", 8000),

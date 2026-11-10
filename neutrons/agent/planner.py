@@ -76,7 +76,7 @@ class Planner:
             raise PlanningError("no_supported_actions", "No task actions are enabled.")
 
         schema_text = json.dumps(self._action_schemas, ensure_ascii=False)
-        raw = self._gateway.chat(
+        raw = self._gateway.chat_json(
             user_message,
             system_prompt=(
                 "Create a bounded JSON execution plan using only the supplied registered actions. "

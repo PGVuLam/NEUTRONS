@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from neutrons.agent.core import AgentCore
+from neutrons.agent.executor import ActionRegistry, PermissionPolicy
+from neutrons.agent.response_policy import build_system_prompt
+from neutrons.agent.schemas import TaskExecutionResult
 from neutrons.config import Settings, settings
 from neutrons.model_gateway import ChatModelGateway, ModelGatewayError, OllamaChatGateway
 
@@ -16,6 +19,7 @@ class OrchestratorResult:
     response: str
     model: str
     status: str = "ok"
+    task_result: TaskExecutionResult | None = None
 
 
 class AgentOrchestrator:
@@ -25,13 +29,20 @@ class AgentOrchestrator:
         self,
         gateway: ChatModelGateway | None = None,
         configuration: Settings = settings,
+        action_registry: ActionRegistry | None = None,
+        permission_policy: PermissionPolicy | None = None,
     ) -> None:
         self.gateway = gateway if gateway is not None else OllamaChatGateway(configuration=configuration)
         self.configuration = configuration
-        self.agent_core = AgentCore(self.gateway, chat_system_prompt=self.build_system_prompt())
+        self.agent_core = AgentCore(
+            self.gateway,
+            registry=action_registry,
+            permission_policy=permission_policy,
+            chat_system_prompt=self.build_system_prompt(),
+        )
 
     def build_system_prompt(self) -> str:
-        return (
+        return build_system_prompt(
             "Bạn là NEUTRONS, một trợ lý AI cá nhân chạy cục bộ. "
             "Hãy trả lời rõ ràng, ngắn gọn, có cấu trúc, và ưu tiên an toàn, "
             "tính thực tế và hướng dẫn thực thi rõ ràng khi phù hợp."
@@ -70,6 +81,7 @@ class AgentOrchestrator:
             response=response_text,
             model=self.gateway.model_name,
             status=core_result.status,
+            task_result=core_result.task_result,
         )
 
     def _limit_history(

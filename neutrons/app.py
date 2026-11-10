@@ -9,6 +9,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
+from neutrons.agent.executor import ActionRegistry, PermissionPolicy
 from neutrons.config import settings
 from neutrons.logging_config import configure_logging
 from neutrons.model_gateway import (
@@ -18,6 +19,7 @@ from neutrons.model_gateway import (
     ModelUnavailableError,
 )
 from neutrons.orchestrator import AgentOrchestrator
+from neutrons.agent.state import TaskStateManager
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -76,7 +78,13 @@ class ChatResponse(BaseModel):
     status: str = "ok"
 
 
-orchestrator = AgentOrchestrator()
+action_registry = ActionRegistry()
+permission_policy = PermissionPolicy()
+task_state_manager = TaskStateManager()
+orchestrator = AgentOrchestrator(
+    action_registry=action_registry,
+    permission_policy=permission_policy,
+)
 
 
 @app.get("/healthz")

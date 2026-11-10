@@ -54,8 +54,11 @@ class ActionSpec:
 class ActionRegistry:
     def __init__(self) -> None:
         self._actions: dict[str, ActionSpec] = {}
+        self._frozen = False
 
     def register(self, action: ActionSpec) -> None:
+        if self._frozen:
+            raise RuntimeError("The action registry is frozen")
         if not action.name or len(action.name) > 64:
             raise ValueError("Action names must contain between 1 and 64 characters")
         if action.name in self._actions:
@@ -73,6 +76,9 @@ class ActionRegistry:
                 f"Action timeout must be greater than 0 and at most {MAX_ACTION_TIMEOUT_SECONDS} seconds"
             )
         self._actions[action.name] = action
+
+    def freeze(self) -> None:
+        self._frozen = True
 
     def get(self, name: str) -> ActionSpec | None:
         return self._actions.get(name)
@@ -119,7 +125,6 @@ class Executor:
         state: TaskStateManager,
         *,
         cancellation: threading.Event | None = None,
-        confirmed_steps: frozenset[str] = frozenset(),
     ) -> list[StepResult]:
         if len(plan.steps) > self._max_steps:
             raise ValueError("Plan exceeds the executor step limit")
@@ -144,7 +149,7 @@ class Executor:
                 results[step.step_id] = self._finish(state, task_id, step, StepStatus.SKIPPED)
                 continue
             result = await self._execute_step(
-                step, task_id, state, cancellation, step.step_id in confirmed_steps
+                step, task_id, state, cancellation
             )
             results[step.step_id] = result
             if result.status not in {StepStatus.SUCCEEDED, StepStatus.SKIPPED}:
@@ -182,7 +187,6 @@ class Executor:
         task_id: str,
         state: TaskStateManager,
         cancellation: threading.Event,
-        confirmed: bool,
     ) -> StepResult:
         action = self._registry.get(step.action)
         state.transition_step(task_id, step.step_id, StepStatus.RUNNING)
@@ -194,7 +198,7 @@ class Executor:
             return self._finish(
                 state, task_id, step, StepStatus.FAILED, error_code="permission_denied"
             )
-        if action.requires_confirmation and not confirmed:
+        if action.requires_confirmation:
             return self._finish(
                 state,
                 task_id,

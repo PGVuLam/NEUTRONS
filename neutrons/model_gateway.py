@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -9,6 +10,7 @@ import httpx
 from neutrons.config import Settings, settings
 
 logger = logging.getLogger(__name__)
+_UNRESOLVED = object()
 
 
 class ModelGatewayError(RuntimeError):
@@ -39,6 +41,10 @@ class EmptyModelResponseError(InvalidModelResponseError):
     """Raised when the model did not produce user-facing text."""
 
 
+class ModelCapabilityError(ModelGatewayError):
+    """Raised when a configured model does not support a requested capability."""
+
+
 @dataclass(frozen=True, slots=True)
 class ModelInfo:
     name: str
@@ -54,6 +60,13 @@ class ChatModelGateway(Protocol):
         self,
         user_message: str,
         system_prompt: str | None = None,
+        history: Sequence[Mapping[str, str]] | None = None,
+    ) -> str: ...
+
+    def chat_json(
+        self,
+        user_message: str,
+        system_prompt: str,
         history: Sequence[Mapping[str, str]] | None = None,
     ) -> str: ...
 
@@ -75,6 +88,51 @@ class OllamaChatGateway:
         self.model_name = model_name or configuration.model_name
         self.configuration = configuration
         self.timeout = configuration.request_timeout_seconds
+        self._thinking_value: bool | None | object = _UNRESOLVED
+        self._thinking_lock = threading.Lock()
+
+    def _resolve_thinking_value(self) -> bool | None:
+        with self._thinking_lock:
+            if self._thinking_value is not _UNRESOLVED:
+                if self._thinking_value is None or isinstance(self._thinking_value, bool):
+                    return self._thinking_value
+                raise RuntimeError("Cached Ollama thinking capability is invalid")
+
+            data = self._request_json(
+                "POST", "api/show", {"model": self.model_name}
+            )
+            thinking = data.get("thinking")
+            if thinking is None:
+                values: list[object] = []
+            elif isinstance(thinking, dict) and isinstance(thinking.get("values"), list):
+                values = thinking["values"]
+            else:
+                raise InvalidModelResponseError("Ollama thinking capability metadata is malformed")
+
+            if any(not isinstance(value, (bool, str)) for value in values):
+                raise InvalidModelResponseError("Ollama thinking capability values are malformed")
+            mode = self.configuration.thinking_mode
+            if mode == "disabled":
+                if False not in values:
+                    raise ModelCapabilityError(
+                        "The configured model does not support disabling thinking"
+                    )
+                resolved: bool | None = False
+            elif mode == "enabled":
+                if True not in values:
+                    raise ModelCapabilityError(
+                        "The configured model does not support enabling thinking"
+                    )
+                resolved = True
+            elif False in values:
+                resolved = False
+            elif True in values:
+                resolved = True
+            else:
+                resolved = None
+
+            self._thinking_value = resolved
+            return resolved
 
     def _request_json(
         self,
@@ -160,10 +218,27 @@ class OllamaChatGateway:
         system_prompt: str | None = None,
         history: Sequence[Mapping[str, str]] | None = None,
     ) -> str:
+        return self._chat(user_message, system_prompt, history)
+
+    def chat_json(
+        self,
+        user_message: str,
+        system_prompt: str,
+        history: Sequence[Mapping[str, str]] | None = None,
+    ) -> str:
+        return self._chat(user_message, system_prompt, history, json_mode=True)
+
+    def _chat(
+        self,
+        user_message: str,
+        system_prompt: str | None,
+        history: Sequence[Mapping[str, str]] | None,
+        *,
+        json_mode: bool = False,
+    ) -> str:
         payload: dict[str, Any] = {
             "model": self.model_name,
             "messages": self._build_messages(user_message, system_prompt, history),
-            "think": False,
             "stream": False,
             "options": {
                 "temperature": self.configuration.temperature,
@@ -171,6 +246,11 @@ class OllamaChatGateway:
                 "num_ctx": self.configuration.num_ctx,
             },
         }
+        thinking_value = self._resolve_thinking_value()
+        if thinking_value is not None:
+            payload["think"] = thinking_value
+        if json_mode:
+            payload["format"] = "json"
         data = self._request_json("POST", "api/chat", payload)
         message = data.get("message")
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -178,13 +258,23 @@ class OllamaChatGateway:
         content = message.get("content")
         if not isinstance(content, str):
             raise InvalidModelResponseError("Ollama assistant content must be text")
-        if "</think>" in content:
-            content = content.rsplit("</think>", maxsplit=1)[-1]
+        thinking_field = message.get("thinking", "")
+        if not isinstance(thinking_field, str):
+            raise InvalidModelResponseError("Ollama assistant thinking field must be text")
+        if "<think>" in content or "</think>" in content:
+            raise InvalidModelResponseError("Ollama mixed reasoning markers into assistant content")
         if not content.strip():
             raise EmptyModelResponseError("Ollama returned no final answer")
+        self._validate_completion(data)
+        return content.strip()
+
+    @staticmethod
+    def _validate_completion(data: Mapping[str, Any]) -> None:
         if data.get("done") is not True:
             raise InvalidModelResponseError("Ollama response did not complete generation")
-        return content.strip()
+        done_reason = data.get("done_reason")
+        if done_reason is not None and done_reason != "stop":
+            raise InvalidModelResponseError("Ollama generation ended before a normal stop")
 
     def generate(self, prompt: str, system_prompt: str | None = None) -> str:
         payload: dict[str, Any] = {
@@ -198,14 +288,21 @@ class OllamaChatGateway:
                 "num_ctx": self.configuration.num_ctx,
             },
         }
+        thinking_value = self._resolve_thinking_value()
+        if thinking_value is not None:
+            payload["think"] = thinking_value
         data = self._request_json("POST", "api/generate", payload)
         content = data.get("response")
         if not isinstance(content, str):
             raise InvalidModelResponseError("Ollama generated response must be text")
+        thinking_field = data.get("thinking", "")
+        if not isinstance(thinking_field, str):
+            raise InvalidModelResponseError("Ollama generated thinking field must be text")
+        if "<think>" in content or "</think>" in content:
+            raise InvalidModelResponseError("Ollama mixed reasoning markers into generated content")
         if not content.strip():
             raise EmptyModelResponseError("Ollama returned an empty generated response")
-        if data.get("done") is not True:
-            raise InvalidModelResponseError("Ollama response did not complete generation")
+        self._validate_completion(data)
         return content.strip()
 
     def check_health(self, timeout: float | None = None) -> bool:
