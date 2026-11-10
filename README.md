@@ -1,107 +1,156 @@
 # NEUTRONS
 
-NEUTRONS là hệ thống trợ lý AI cá nhân chạy cục bộ, được xây dựng theo mô hình modular và local-first. Dự án hiện đang ở giai đoạn khởi tạo: backend API, lớp mô hình cục bộ qua Ollama, và bộ orchestrator để xử lý nhiệm vụ cơ bản.
+NEUTRONS là trợ lý AI cá nhân theo hướng local-first. Phiên bản hiện tại gồm giao
+diện desktop Tkinter, API FastAPI, bộ điều phối chat và gateway kết nối duy nhất
+đến model Ollama đã cấu hình. Backend chỉ bind vào `127.0.0.1`.
 
-## Mục tiêu kiến trúc
+## Kiến trúc hiện tại
 
-- Local-first: không phụ thuộc vào nền tảng đám mây cho thời điểm chạy chính.
-- Một mô hình cục bộ: hiện tại dùng Ollama với `qwen3:4b`.
-- Tách rõ trách nhiệm: cấu hình, API, model gateway, orchestration.
-- Dễ mở rộng: thêm module chuyên môn trong tương lai mà không phá vỡ thiết kế.
-
-## Kiểm tra môi trường hiện tại
-
-Environment đã được xác minh với:
-
-```powershell
-echo %OLLAMA_MODELS%
-ollama list
-curl http://127.0.0.1:11434/api/tags
+```mermaid
+flowchart LR
+    UI[Tkinter Desktop] --> API[FastAPI API]
+    API --> CORE[Agent Orchestrator]
+    CORE --> GATEWAY[Chat Model Gateway]
+    GATEWAY --> OLLAMA[Ollama local]
+    OLLAMA --> MODEL[Model đã cấu hình]
 ```
 
-Kết quả hợp lệ phải trỏ đến:
+- `neutrons/desktop.py`: cửa sổ chat; gọi HTTP ở worker thread và cập nhật
+  widget qua queue trên main thread.
+- `neutrons/app.py`: request validation, giới hạn kích thước, API errors và
+  request lifecycle logs.
+- `neutrons/orchestrator.py`: xác thực tin nhắn, giới hạn lịch sử hội thoại và
+  gọi interface của model gateway.
+- `neutrons/model_gateway.py`: interface chat cùng adapter Ollama, kiểm tra
+  response, model availability và model metadata.
+- `neutrons/config.py`: settings từ environment, kiểm tra giá trị và defaults.
+- `neutrons/logging_config.py`: JSON logs, không ghi nội dung hội thoại.
 
-```text
-E:\OllamaModels\models
-```
+## Cài đặt
 
-Hiện tại model `qwen3:4b` đã tồn tại và sẵn sàng dùng.
+Yêu cầu: Python 3.10 trở lên, môi trường ảo của dự án, Ollama đang chạy và model
+đã được cài đặt sẵn. NEUTRONS không tự tải model hay thay đổi thư mục model Ollama.
 
-## Chạy giao diện desktop trên Windows
-
-Đảm bảo Ollama đang chạy và model `qwen3:4b` đã có. Mở thư mục dự án rồi:
-
-1. Cài đặt các dependency (chỉ cần làm lần đầu):
+Trong **PowerShell**, từ thư mục dự án:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+ollama list
+Invoke-RestMethod http://127.0.0.1:11434/api/tags
 ```
 
-2. Nhấp đúp `start_neutrons.bat`, hoặc chạy trong PowerShell:
+Nếu chưa có `.venv`, tạo một lần bằng:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+## Cấu hình
+
+Các biến môi trường tùy chọn:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---:|---|
+| `NEUTRONS_MODEL` | `qwen3:4b` | Tên model có sẵn trong Ollama |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Địa chỉ Ollama (HTTP/HTTPS, không chứa credentials) |
+| `NEUTRONS_REQUEST_TIMEOUT` | `120` | Timeout request model, tính bằng giây |
+| `NEUTRONS_TEMPERATURE` | `0.2` | Generation temperature (0–2) |
+| `NEUTRONS_NUM_PREDICT` | `512` | Số token sinh tối đa |
+| `NEUTRONS_NUM_CTX` | `4096` | Context window gửi cho Ollama |
+| `NEUTRONS_API_PORT` | `8000` | Port API desktop sử dụng |
+| `NEUTRONS_MAX_HISTORY_MESSAGES` | `40` | Số tin nhắn history tối đa |
+| `NEUTRONS_MAX_HISTORY_CHARS` | `12000` | Giới hạn ký tự history gửi đến model |
+| `NEUTRONS_MAX_REQUEST_CHARS` | `50000` | Giới hạn tổng ký tự trong request chat |
+| `NEUTRONS_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` hoặc `CRITICAL` |
+
+PowerShell đặt biến cho cửa sổ hiện tại bằng `$env:NEUTRONS_NUM_PREDICT = "256"`.
+Trong **CMD**, cú pháp tương đương là `set NEUTRONS_NUM_PREDICT=256`.
+Thay đổi environment rồi khởi động lại ứng dụng để settings được nạp lại.
+
+Settings sai định dạng hoặc ngoài giới hạn sẽ báo lỗi khi ứng dụng khởi động.
+Lịch sử chỉ giữ các tin mới nhất trong giới hạn cấu hình; đây là giới hạn theo
+số ký tự, chưa phải bộ đếm token chính xác.
+
+## Chạy giao diện desktop trên Windows
+
+Nhấp đúp `start_neutrons.bat`, hoặc chạy trong PowerShell:
 
 ```powershell
 .\.venv\Scripts\python.exe -m neutrons.desktop
 ```
 
-Ứng dụng sẽ tự khởi động backend trên `127.0.0.1:8000` nếu backend chưa chạy,
-sau đó mở cửa sổ chat. Khi đóng UI, backend do UI khởi chạy cũng sẽ được dừng.
-Nếu backend NEUTRONS đã chạy sẵn, ứng dụng sẽ kết nối vào đó và không dừng server
-đó khi đóng cửa sổ.
+Desktop kiểm tra backend tại `127.0.0.1:<NEUTRONS_API_PORT>`. Nếu chưa có backend,
+nó tự khởi động một tiến trình local và giữ log để báo lỗi nếu khởi động thất
+bại. Nếu port đã có ứng dụng khác, giao diện báo port conflict thay vì im lặng
+khởi một server thứ hai.
 
-Giao diện gửi tin nhắn qua API cục bộ; phản hồi model có thể mất một lúc, tùy
-hiệu năng máy. `Enter` gửi tin nhắn và `Shift+Enter` xuống dòng.
-Trên máy chỉ dùng CPU, một câu trả lời ngắn vẫn có thể mất vài chục giây. Model
-Qwen3 được giới hạn tối đa 512 token mỗi lượt để tránh sinh suy nghĩ quá dài và
-vượt thời gian chờ của backend.
+Khi đóng giao diện, tiến trình backend do chính giao diện khởi chạy sẽ được dừng.
+Backend đã chạy sẵn sẽ không bị dừng. `Enter` gửi tin nhắn; `Shift+Enter` xuống
+dòng. Câu trả lời trên máy chạy model bằng CPU có thể cần vài chục giây.
 
-## Chạy backend riêng (tùy chọn)
-
-1. Tạo môi trường ảo nếu cần.
-2. Cài đặt dependency:
+## Chạy API độc lập (PowerShell)
 
 ```powershell
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn neutrons.app:app --host 127.0.0.1 --port 8000
 ```
 
-3. Khởi động FastAPI:
+Nếu đã đặt `NEUTRONS_API_PORT` khác `8000`, thay port trong lệnh trên cho khớp.
+Không chạy thêm `ollama serve` nếu Ollama đã lắng nghe port `11434`.
+
+Kiểm tra tình trạng backend:
 
 ```powershell
-python -m uvicorn neutrons.app:app --reload --host 127.0.0.1 --port 8000
+Invoke-RestMethod http://127.0.0.1:8000/healthz
 ```
 
-4. Kiểm tra sức khỏe API:
+Swagger UI: `http://127.0.0.1:8000/docs`.
 
-```powershell
-curl http://127.0.0.1:8000/healthz
-```
+### Chat API
 
-## API
-
-### GET /healthz
-
-Trả về trạng thái hệ thống.
-
-### POST /api/v1/chat
-
-Body mẫu:
+`POST /api/v1/chat`:
 
 ```json
 {
-  "message": "Xin chào NEUTRONS, hãy tóm tắt kế hoạch công việc của tôi."
+  "message": "Xin chào NEUTRONS",
+  "history": []
 }
 ```
 
-Khi server đang chạy, hệ thống sẽ gọi Ollama local và trả về câu trả lời mô hình đã cấu hình.
+History tùy chọn chỉ nhận `user` và `assistant`. Lỗi request trả 4xx; timeout
+model trả 504; Ollama/model không sẵn sàng trả 503; response model không hợp lệ
+trả 502. Chi tiết nội bộ của provider không được trả cho client.
 
-## Lưu ý kỹ thuật
+## Kiểm thử
 
-- NEUTRONS không tích hợp thêm provider ngoài Ollama ở giai đoạn hiện tại.
-- Tất cả mô hình inference đều đi qua một lớp giao diện duy nhất để dễ thay đổi sau này.
-- Nếu `ollama serve` đang ở port `11434`, không khởi động server thứ hai.
+Chạy toàn bộ test trong **PowerShell**:
 
-## Giai đoạn tiếp theo đề xuất
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
 
-1. Tạo module lưu trữ memory và session.
-2. Thêm bộ planner/task breakdown.
-3. Tạo module tools cho file và hệ thống.
-4. Mở rộng UI dashboard theo nhu cầu.
+Test gateway sử dụng HTTP mock; bộ test thông thường không cần Ollama đang chạy
+và không tải model.
+
+## Khắc phục sự cố
+
+- **Port API đang được sử dụng:** đóng backend NEUTRONS cũ hoặc cấu hình
+  `NEUTRONS_API_PORT` sang port khác; cập nhật port trong lệnh Uvicorn nếu chạy
+  API độc lập.
+- **Ollama không kết nối được:** kiểm tra `ollama list` và
+  `Invoke-RestMethod http://127.0.0.1:11434/api/tags`.
+- **Model không tìm thấy:** xác nhận `NEUTRONS_MODEL` trùng với tên trong
+  `ollama list`; NEUTRONS không tự pull/download model.
+- **Timeout khi chat:** kiểm tra Ollama có đang xử lý request khác không. Có thể
+  tăng `NEUTRONS_REQUEST_TIMEOUT`; giảm `NEUTRONS_NUM_PREDICT` để giới hạn độ
+  dài câu trả lời.
+- **Backend desktop khởi động thất bại:** thông báo lỗi có chứa log startup của
+  backend. Kiểm tra dependency bằng `pip install -r requirements.txt`.
+
+## Giới hạn và lộ trình
+
+Hiện tại NEUTRONS là chat local đơn model, không có memory bền vững, session
+manager, planner, tool execution, streaming hoặc event bus. History hiện do
+desktop gửi lên trong từng request, chưa được lưu xuống SQLite. Các bước tiếp
+theo là Agent Core (intent/planner/executor), SQLite conversation memory, công
+cụ read-only có quyền hạn, rồi tích hợp session vào desktop.

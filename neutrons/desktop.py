@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import logging
 import queue
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
-from typing import Any
+from pathlib import Path
+from typing import Any, BinaryIO, Protocol
 
 import httpx
 
 from neutrons.config import settings
+from neutrons.logging_config import configure_logging
 
 WINDOW_TITLE = "NEUTRONS"
 BACKGROUND = "#111318"
@@ -20,11 +25,48 @@ PANEL = "#1c2029"
 ACCENT = "#7c9cff"
 TEXT = "#eef1f7"
 MUTED = "#9aa3b2"
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = f"http://127.0.0.1:{settings.api_port}"
+logger = logging.getLogger(__name__)
 
 
 class DesktopStartupError(RuntimeError):
     """Raised when the desktop app cannot connect to its local backend."""
+
+
+class ProcessHandle(Protocol):
+    def poll(self) -> int | None: ...
+
+    def terminate(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+    def kill(self) -> None: ...
+
+
+class ManagedBackend:
+    def __init__(self, process: ProcessHandle, output: BinaryIO) -> None:
+        self.process = process
+        self.output = output
+
+    def diagnostic_output(self) -> str:
+        self.output.flush()
+        self.output.seek(0)
+        return self.output.read().decode("utf-8", errors="replace")[-4000:].strip()
+
+    def stop(self) -> None:
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        except ProcessLookupError:
+            pass
+
+    def close_output(self) -> None:
+        self.output.close()
 
 
 def backend_is_healthy(client: httpx.Client) -> bool:
@@ -43,53 +85,87 @@ def backend_is_healthy(client: httpx.Client) -> bool:
     return payload.get("status") == "ok" and payload.get("app") == settings.app_name
 
 
-def ensure_backend() -> subprocess.Popen[bytes] | None:
+def _port_is_open() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", settings.api_port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _startup_error_message(message: str, backend: ManagedBackend | None = None) -> str:
+    diagnostics = backend.diagnostic_output() if backend else ""
+    if diagnostics:
+        return f"{message}\n\nBackend log:\n{diagnostics}"
+    return message
+
+
+def ensure_backend() -> ManagedBackend | None:
     with httpx.Client(timeout=1.0) as client:
         if backend_is_healthy(client):
             return None
 
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "neutrons.app:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8000",
-        ],
-        cwd=None,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    if _port_is_open():
+        raise DesktopStartupError(
+            f"Port {settings.api_port} đang được một ứng dụng khác sử dụng, "
+            "hoặc dịch vụ ở đó không phải backend NEUTRONS."
+        )
+
+    output = tempfile.TemporaryFile(mode="w+b")
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "neutrons.app:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(settings.api_port),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        output.close()
+        raise DesktopStartupError(f"Không thể tạo tiến trình backend: {exc}") from exc
+    backend = ManagedBackend(process, output)
 
     deadline = time.monotonic() + 20
     with httpx.Client(timeout=1.0) as client:
         while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise DesktopStartupError(
-                    "Không thể khởi động backend NEUTRONS. Hãy kiểm tra môi trường Python và port 8000."
+            if backend.process.poll() is not None:
+                message = _startup_error_message(
+                    "Backend NEUTRONS dừng ngay sau khi khởi động.", backend
                 )
+                backend.stop()
+                backend.close_output()
+                raise DesktopStartupError(message)
             if backend_is_healthy(client):
-                return process
+                logger.info(
+                    "Started local backend",
+                    extra={
+                        "event": "desktop_backend_started",
+                        "context": {"port": settings.api_port},
+                    },
+                )
+                return backend
             time.sleep(0.25)
 
-    process.terminate()
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-    raise DesktopStartupError(
-        "Backend không phản hồi sau 20 giây. Hãy kiểm tra port 8000 rồi thử lại."
+    backend.stop()
+    message = _startup_error_message(
+        f"Backend không phản hồi sau 20 giây tại port {settings.api_port}.", backend
     )
+    backend.close_output()
+    raise DesktopStartupError(message)
 
 
 class NeutronsDesktop:
-    def __init__(self, root: tk.Tk, backend_process: subprocess.Popen[bytes] | None) -> None:
+    def __init__(self, root: tk.Tk, backend_process: ManagedBackend | None) -> None:
         self.root = root
         self.backend_process = backend_process
         self.results: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -247,7 +323,6 @@ class NeutronsDesktop:
         )
         self.input.grid(row=0, column=0, sticky="ew")
         self.input.bind("<Return>", self._on_enter)
-        self.input.bind("<Shift-Return>", lambda _event: None)
         ttk.Button(compose, text="Gửi  ➤", style="Send.TButton", command=self.send_message).grid(
             row=0, column=1, sticky="se"
         )
@@ -341,6 +416,8 @@ class NeutronsDesktop:
             )
             response.raise_for_status()
             payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Backend trả về dữ liệu không hợp lệ.")
             answer = payload.get("response")
             if not isinstance(answer, str) or not answer.strip():
                 raise ValueError("Backend trả về câu trả lời không hợp lệ.")
@@ -387,29 +464,42 @@ class NeutronsDesktop:
         self._show_welcome()
 
     def close(self) -> None:
-        if self.backend_process is not None and self.backend_process.poll() is None:
-            self.backend_process.terminate()
-            try:
-                self.backend_process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.backend_process.kill()
-                self.backend_process.wait()
-        self.root.destroy()
+        try:
+            if self.backend_process is not None:
+                try:
+                    self.backend_process.stop()
+                finally:
+                    self.backend_process.close_output()
+        finally:
+            self.root.destroy()
 
 
 def main() -> None:
+    configure_logging()
     try:
         backend_process = ensure_backend()
     except DesktopStartupError as exc:
+        logger.error(
+            "Desktop backend startup failed",
+            extra={"event": "desktop_backend_startup_failed"},
+        )
         root = tk.Tk()
         root.withdraw()
         messagebox.showerror("Không thể khởi động NEUTRONS", str(exc))
         root.destroy()
         raise SystemExit(1) from exc
 
-    root = tk.Tk()
-    NeutronsDesktop(root, backend_process)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        NeutronsDesktop(root, backend_process)
+        root.mainloop()
+    except Exception:
+        if backend_process is not None:
+            try:
+                backend_process.stop()
+            finally:
+                backend_process.close_output()
+        raise
 
 
 if __name__ == "__main__":

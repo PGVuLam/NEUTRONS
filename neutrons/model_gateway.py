@@ -1,35 +1,135 @@
 from __future__ import annotations
 
-from typing import Any, Sequence
+import logging
+from dataclasses import dataclass
+from typing import Any, Mapping, Protocol, Sequence
 
 import httpx
 
-from neutrons.config import settings
+from neutrons.config import Settings, settings
+
+logger = logging.getLogger(__name__)
 
 
 class ModelGatewayError(RuntimeError):
-    """Raised when the local model gateway cannot complete the request."""
+    """Base error for model-provider failures."""
+
+
+class ModelUnavailableError(ModelGatewayError):
+    """Raised when the configured model service cannot be used."""
+
+
+class ModelNotFoundError(ModelUnavailableError):
+    """Raised when the configured model is not installed in Ollama."""
+
+
+class ModelTimeoutError(ModelGatewayError):
+    """Raised when Ollama does not respond before the configured timeout."""
+
+
+class InvalidModelResponseError(ModelGatewayError):
+    """Raised when Ollama returns an invalid or incomplete response."""
+
+
+class EmptyModelResponseError(InvalidModelResponseError):
+    """Raised when the model did not produce user-facing text."""
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInfo:
+    name: str
+    digest: str | None
+    size_bytes: int | None
+    modified_at: str | None
+
+
+class ChatModelGateway(Protocol):
+    model_name: str
+
+    def chat(
+        self,
+        user_message: str,
+        system_prompt: str | None = None,
+        history: Sequence[Mapping[str, str]] | None = None,
+    ) -> str: ...
+
+    def check_health(self) -> bool: ...
+
+    def get_model_info(self) -> ModelInfo | None: ...
 
 
 class OllamaChatGateway:
-    """Thin abstraction over the local Ollama HTTP API."""
+    """Provider-specific HTTP adapter for the local Ollama API."""
 
-    def __init__(self, base_url: str | None = None, model_name: str | None = None) -> None:
-        self.base_url = (base_url or settings.ollama_base_url).rstrip("/")
-        self.model_name = model_name or settings.model_name
-        self.timeout = settings.request_timeout_seconds
+    def __init__(
+        self,
+        base_url: str | None = None,
+        model_name: str | None = None,
+        configuration: Settings = settings,
+    ) -> None:
+        self.base_url = (base_url or configuration.ollama_base_url).rstrip("/")
+        self.model_name = model_name or configuration.model_name
+        self.configuration = configuration
+        self.timeout = configuration.request_timeout_seconds
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        try:
+            if method == "POST":
+                response = httpx.post(url, json=payload, timeout=self.timeout)
+            elif method == "GET":
+                response = httpx.get(url, timeout=self.timeout)
+            else:
+                raise ValueError(f"Unsupported Ollama HTTP method: {method}")
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "Ollama request timed out",
+                extra={"event": "model_request_timeout", "context": {"model": self.model_name}},
+            )
+            raise ModelTimeoutError("Ollama did not respond before the configured timeout") from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise ModelNotFoundError("The configured Ollama model or API endpoint was not found") from exc
+            raise ModelUnavailableError(
+                f"Ollama returned HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.warning(
+                "Ollama service is unreachable",
+                extra={"event": "model_service_unreachable", "context": {"model": self.model_name}},
+            )
+            raise ModelUnavailableError("Could not connect to the configured Ollama service") from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise InvalidModelResponseError("Ollama returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise InvalidModelResponseError("Ollama returned an unexpected response type")
+        if "error" in data:
+            raise ModelUnavailableError("Ollama reported an error while processing the request")
+        return data
 
     def _build_messages(
         self,
         user_message: str,
         system_prompt: str | None = None,
-        history: Sequence[dict[str, str]] | None = None,
+        history: Sequence[Mapping[str, str]] | None = None,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         if history:
-            messages.extend(history)
+            messages.extend(
+                {"role": message["role"], "content": message["content"]}
+                for message in history
+            )
         messages.append({"role": "user", "content": user_message})
         return messages
 
@@ -37,33 +137,32 @@ class OllamaChatGateway:
         self,
         user_message: str,
         system_prompt: str | None = None,
-        history: Sequence[dict[str, str]] | None = None,
+        history: Sequence[Mapping[str, str]] | None = None,
     ) -> str:
         payload: dict[str, Any] = {
             "model": self.model_name,
             "messages": self._build_messages(user_message, system_prompt, history),
             "think": False,
             "stream": False,
-            "options": {"temperature": 0.2, "num_predict": 512},
+            "options": {
+                "temperature": self.configuration.temperature,
+                "num_predict": self.configuration.num_predict,
+                "num_ctx": self.configuration.num_ctx,
+            },
         }
-
-        try:
-            response = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:  # pragma: no cover - depends on runtime service
-            raise ModelGatewayError(f"Failed to reach local Ollama at {self.base_url}: {exc}") from exc
-
-        try:
-            data = response.json()
-        except ValueError as exc:  # pragma: no cover - protocol-level validation
-            raise ModelGatewayError("Received invalid JSON from Ollama") from exc
-
-        message = data.get("message", {})
-        content = message.get("content", "") if isinstance(message, dict) else ""
-        if isinstance(content, str) and "</think>" in content:
+        data = self._request_json("POST", "api/chat", payload)
+        message = data.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            raise InvalidModelResponseError("Ollama returned a malformed assistant message")
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise InvalidModelResponseError("Ollama assistant content must be text")
+        if "</think>" in content:
             content = content.rsplit("</think>", maxsplit=1)[-1]
-        if not isinstance(content, str) or not content.strip():
-            raise ModelGatewayError("Ollama returned no final answer within the generation limit")
+        if not content.strip():
+            raise EmptyModelResponseError("Ollama returned no final answer")
+        if data.get("done") is not True:
+            raise InvalidModelResponseError("Ollama response did not complete generation")
         return content.strip()
 
     def generate(self, prompt: str, system_prompt: str | None = None) -> str:
@@ -72,20 +171,49 @@ class OllamaChatGateway:
             "prompt": prompt,
             "system": system_prompt,
             "stream": False,
+            "options": {
+                "temperature": self.configuration.temperature,
+                "num_predict": self.configuration.num_predict,
+                "num_ctx": self.configuration.num_ctx,
+            },
         }
-
-        try:
-            response = httpx.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:  # pragma: no cover - depends on runtime service
-            raise ModelGatewayError(f"Failed to reach local Ollama at {self.base_url}: {exc}") from exc
-
-        try:
-            data = response.json()
-        except ValueError as exc:  # pragma: no cover - protocol-level validation
-            raise ModelGatewayError("Received invalid JSON from Ollama") from exc
-
-        content = data.get("response", "")
-        if not isinstance(content, str) or not content.strip():
-            raise ModelGatewayError("Ollama returned an empty response")
+        data = self._request_json("POST", "api/generate", payload)
+        content = data.get("response")
+        if not isinstance(content, str):
+            raise InvalidModelResponseError("Ollama generated response must be text")
+        if not content.strip():
+            raise EmptyModelResponseError("Ollama returned an empty generated response")
+        if data.get("done") is not True:
+            raise InvalidModelResponseError("Ollama response did not complete generation")
         return content.strip()
+
+    def check_health(self) -> bool:
+        data = self._request_json("GET", "api/tags")
+        if not isinstance(data.get("models"), list):
+            raise InvalidModelResponseError("Ollama model-list response is malformed")
+        return True
+
+    def get_model_info(self) -> ModelInfo | None:
+        data = self._request_json("GET", "api/tags")
+        models = data.get("models")
+        if not isinstance(models, list):
+            raise InvalidModelResponseError("Ollama model-list response is malformed")
+
+        for item in models:
+            if not isinstance(item, dict):
+                raise InvalidModelResponseError("Ollama model-list contains an invalid entry")
+            name = item.get("name")
+            if not isinstance(name, str):
+                raise InvalidModelResponseError("Ollama model-list entry is missing its name")
+            if name == self.model_name:
+                digest = item.get("digest")
+                size = item.get("size")
+                modified_at = item.get("modified_at")
+                if digest is not None and not isinstance(digest, str):
+                    raise InvalidModelResponseError("Ollama model digest must be text")
+                if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
+                    raise InvalidModelResponseError("Ollama model size must be a non-negative integer")
+                if modified_at is not None and not isinstance(modified_at, str):
+                    raise InvalidModelResponseError("Ollama model timestamp must be text")
+                return ModelInfo(name, digest, size, modified_at)
+        return None
